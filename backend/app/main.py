@@ -1,18 +1,58 @@
-from fastapi import Depends, FastAPI, HTTPException, status
+"""FastAPI application entry point.
+
+Routing
+-------
+* Every feature lives under `/api`.
+* `/auth/*` and `/health` are additionally mounted at the root, so the original
+  registration/login contract used by `src/authApi.ts` keeps working unchanged.
+"""
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from .api import auth as auth_router
+from .api.router import api_router
 from .config import settings
-from .database import Base, engine, get_db
-from .models import Account, Administrator, Mentor, Student, UserRole
-from .schemas import LoginRequest, RegisterRequest, TokenResponse, UserResponse
-from .security import create_access_token, decode_access_token, hash_password, verify_password
+from .database import Base, SessionLocal, engine
+from .services.seed import seed_reference_data
 
-app = FastAPI(title=settings.app_name)
-bearer_scheme = HTTPBearer()
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Create missing tables (development convenience) and seed the reference dataset."""
+
+    if settings.auto_create_tables:
+        from . import models  # noqa: F401  registers every table on Base.metadata
+
+        Base.metadata.create_all(bind=engine)
+
+    if settings.seed_reference_data:
+        session = SessionLocal()
+        try:
+            seed_reference_data(session)
+        except SQLAlchemyError:
+            session.rollback()
+        finally:
+            session.close()
+
+    yield
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version="2.0.0",
+    description=(
+        "Student Career Intelligence and Placement Management Platform API: career readiness "
+        "score, skill gaps, learning paths, interview preparation, placement drives, "
+        "applications, mentor review, notifications and admin reporting."
+    ),
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,114 +62,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.on_event("startup")
-def create_tables() -> None:
-    Base.metadata.create_all(bind=engine)
+app.include_router(api_router, prefix="/api")
+app.include_router(auth_router.router)  # root level auth paths kept for compatibility
 
 
-def profile_for_account(db: Session, account: Account) -> tuple[str, str]:
-    if account.role == UserRole.student:
-        profile = db.scalar(select(Student).where(Student.account_id == account.id))
-        return profile.registration_number, profile.program
-
-    if account.role == UserRole.mentor:
-        profile = db.scalar(select(Mentor).where(Mentor.account_id == account.id))
-        return profile.employee_code, profile.department
-
-    profile = db.scalar(select(Administrator).where(Administrator.account_id == account.id))
-    return profile.staff_code, profile.office
-
-
-def to_user_response(db: Session, account: Account) -> UserResponse:
-    identifier, department_or_program = profile_for_account(db, account)
-    return UserResponse(
-        id=account.id,
-        full_name=account.full_name,
-        email=account.email,
-        role=account.role,
-        identifier=identifier,
-        department_or_program=department_or_program,
-    )
-
-
-def get_current_account(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
-) -> Account:
-    subject = decode_access_token(credentials.credentials)
-    if subject is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    account = db.get(Account, int(subject))
-    if account is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account no longer exists")
-
-    return account
-
-
-@app.get("/health")
+@app.get("/health", tags=["System"])
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "environment": settings.environment}
 
 
-@app.post("/auth/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> TokenResponse:
-    account = Account(
-        full_name=payload.full_name,
-        email=str(payload.email).lower(),
-        role=payload.role,
-        password_hash=hash_password(payload.password),
+@app.get("/", tags=["System"])
+def root() -> dict[str, str]:
+    return {"name": settings.app_name, "docs": "/docs", "api": "/api", "health": "/health"}
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    """Collapse Pydantic validation output into one readable message."""
+
+    problems: list[str] = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", []) if part != "body")
+        problems.append(f"{location or 'request'}: {error.get('msg', 'invalid value')}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "; ".join(problems) or "Invalid request body"},
     )
-    db.add(account)
-    db.flush()
-
-    if payload.role == UserRole.student:
-        db.add(
-            Student(
-                account_id=account.id,
-                registration_number=payload.identifier,
-                program=payload.department_or_program,
-            ),
-        )
-    elif payload.role == UserRole.mentor:
-        db.add(
-            Mentor(
-                account_id=account.id,
-                employee_code=payload.identifier,
-                department=payload.department_or_program,
-            ),
-        )
-    else:
-        db.add(
-            Administrator(
-                account_id=account.id,
-                staff_code=payload.identifier,
-                office=payload.department_or_program,
-            ),
-        )
-
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email or identifier already exists") from exc
-
-    return TokenResponse(access_token=create_access_token(str(account.id)))
 
 
-@app.post("/auth/login", response_model=TokenResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
-    account = db.scalar(select(Account).where(Account.email == str(payload.email).lower()))
-    if account is None or not verify_password(payload.password, account.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+@app.exception_handler(IntegrityError)
+async def integrity_error_handler(_: Request, __: IntegrityError) -> JSONResponse:
+    """Duplicate keys and constraint violations become a clean 409."""
 
-    return TokenResponse(access_token=create_access_token(str(account.id)))
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={"detail": "That operation conflicts with existing data"},
+    )
 
 
-@app.get("/auth/me", response_model=UserResponse)
-def read_current_user(
-    account: Account = Depends(get_current_account),
-    db: Session = Depends(get_db),
-) -> UserResponse:
-    return to_user_response(db, account)
+@app.exception_handler(SQLAlchemyError)
+async def database_error_handler(_: Request, __: SQLAlchemyError) -> JSONResponse:
+    """Never leak raw SQL or connection strings to the client."""
+
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "detail": (
+                "A database error occurred while processing the request. "
+                "Check the API logs for the full traceback."
+            )
+        },
+    )

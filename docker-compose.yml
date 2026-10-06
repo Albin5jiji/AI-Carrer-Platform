@@ -18,6 +18,10 @@ services:
   api:
     build:
       context: ./backend
+    # Local-only settings (including private S3 credentials) live in backend/.env.
+    # Explicit values below keep the Docker database connection correct.
+    env_file:
+      - ./backend/.env
     environment:
       DATABASE_URL: postgresql+psycopg://career_user:career_pass@postgres:5432/career_platform
       JWT_SECRET_KEY: review-one-local-secret

@@ -1,0 +1,5 @@
+# Alembic generates one file per revision here.
+# Create the first revision with:
+#   alembic revision --autogenerate -m "initial schema"
+# then apply it with:
+#   alembic upgrade head

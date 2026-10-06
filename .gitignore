@@ -1,8 +1,14 @@
 node_modules/
 dist/
 .DS_Store
+**/.DS_Store
+.pytest_cache/
+**/.pytest_cache/
+.freebuff/
 work_srs/
 backend/.venv/
 backend/.pgdata/
 __pycache__/
 *.pyc
+.env
+backend/.env
